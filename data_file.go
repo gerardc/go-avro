@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
+	"os"
 )
 
 var VERSION byte = 1
@@ -39,69 +41,80 @@ func newHeader() *header {
 	return header
 }
 
-func NewDataFileReader(filename string, datumReader DatumReader) (*DataFileReader, error) {
-	if buf, err := ioutil.ReadFile(filename); err != nil {
+func NewDataReader(data io.Reader, datumReader DatumReader) (*DataFileReader, error) {
+	buf, err := ioutil.ReadAll(data)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(buf) < len(MAGIC) || !bytes.Equal(MAGIC, buf[0:4]) {
+		return nil, NotAvroFile
+	}
+
+	dec := NewBinaryDecoder(buf)
+	blockDecoder := NewBinaryDecoder(nil)
+	reader := &DataFileReader{
+		data:         buf,
+		dec:          dec,
+		blockDecoder: blockDecoder,
+		datum:        datumReader,
+	}
+	reader.Seek(4) //skip the magic bytes
+
+	reader.header = newHeader()
+	if metaLength, err := dec.ReadMapStart(); err != nil {
 		return nil, err
 	} else {
-		if len(buf) < len(MAGIC) || !bytes.Equal(MAGIC, buf[0:4]) {
-			return nil, NotAvroFile
-		}
-
-		dec := NewBinaryDecoder(buf)
-		blockDecoder := NewBinaryDecoder(nil)
-		reader := &DataFileReader{
-			data:         buf,
-			dec:          dec,
-			blockDecoder: blockDecoder,
-			datum:        datumReader,
-		}
-		reader.Seek(4) //skip the magic bytes
-
-		reader.header = newHeader()
-		if metaLength, err := dec.ReadMapStart(); err != nil {
-			return nil, err
-		} else {
-			for {
-				var i int64 = 0
-				for i < metaLength {
-					key, err := dec.ReadString()
-					if err != nil {
-						return nil, err
-					}
-
-					value, err := dec.ReadBytes()
-					if err != nil {
-						return nil, err
-					}
-					reader.header.meta[key] = value
-					i++
-				}
-				metaLength, err = dec.MapNext()
+		for {
+			var i int64 = 0
+			for i < metaLength {
+				key, err := dec.ReadString()
 				if err != nil {
 					return nil, err
-				} else if metaLength == 0 {
-					break
 				}
+
+				value, err := dec.ReadBytes()
+				if err != nil {
+					return nil, err
+				}
+				reader.header.meta[key] = value
+				i++
+			}
+			metaLength, err = dec.MapNext()
+			if err != nil {
+				return nil, err
+			} else if metaLength == 0 {
+				break
 			}
 		}
-		dec.ReadFixed(reader.header.sync)
-		//TODO codec?
+	}
+	dec.ReadFixed(reader.header.sync)
+	//TODO codec?
 
-		schema, err := ParseSchema(string(reader.header.meta[SCHEMA_KEY]))
-		if err != nil {
+	schema, err := ParseSchema(string(reader.header.meta[SCHEMA_KEY]))
+	if err != nil {
+		return nil, err
+	}
+	reader.datum.SetSchema(schema)
+	reader.block = &DataBlock{}
+
+	if reader.hasNextBlock() {
+		if err := reader.NextBlock(); err != nil {
 			return nil, err
 		}
-		reader.datum.SetSchema(schema)
-		reader.block = &DataBlock{}
-
-		if reader.hasNextBlock() {
-			if err := reader.NextBlock(); err != nil {
-				return nil, err
-			}
-		}
-
-		return reader, nil
 	}
+
+	return reader, nil
+}
+
+func NewDataFileReader(filename string, datumReader DatumReader) (*DataFileReader, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return NewDataReader(file, datumReader)
 }
 
 func (this *DataFileReader) Seek(pos int64) {
